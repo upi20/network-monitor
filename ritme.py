@@ -225,11 +225,14 @@ def draw_dashboard():
         inner_w = BOX_W - 2
         return f"{BOX_V}{pad_visible(left_text, inner_w)}{BOX_V}"
 
+    # Clear screen immediately, then build frame
+    sys.stdout.write(C_CLEAR_SCREEN + C_HOME + C_HIDE_CURSOR)
+    sys.stdout.flush()
+
+    inner = BOX_W - 2
     out = []
-    out.append(C_CLEAR_SCREEN + C_HOME + C_HIDE_CURSOR)
 
     # ─── HEADER ───
-    inner = BOX_W - 2
     out.append(f"{C_BOLD}{C_CYAN}{BOX_TL}{BOX_H * inner}{BOX_TR}{C_RESET}")
     
     # Baris status
