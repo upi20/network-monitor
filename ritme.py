@@ -11,6 +11,7 @@ import re
 import sys
 import os
 import signal
+import threading
 from datetime import datetime
 from collections import deque
 
@@ -52,6 +53,9 @@ status_terakhir = None
 waktu_perubahan = datetime.now()
 session_start = datetime.now()
 speedtest_result = None
+speedtest_pending = False  # True saat speedtest sedang jalan di background
+speedtest_error = None     # pesan error speedtest
+speedtest_lock = threading.Lock()
 running = True
 
 # ─── FUNCTIONS ──────────────────────────────────────────────
@@ -287,7 +291,11 @@ def draw_dashboard():
 
     # ─── SPEEDTEST ───
     out.append(box_row(f" {C_BOLD}SPEEDTEST{C_RESET} ({C_YELLOW}S{C_RESET}=test)"))
-    if speedtest_result:
+    if speedtest_pending:
+        out.append(box_row(f"   {C_YELLOW}⏳ Menjalankan speedtest...{C_RESET}"))
+    elif speedtest_error:
+        out.append(box_row(f"   {C_RED}✗ {speedtest_error}{C_RESET}"))
+    elif speedtest_result:
         st = speedtest_result
         out.append(box_row(
             f"   {C_GREEN}↓{C_RESET}{st.get('download','?')} "
@@ -366,9 +374,39 @@ def on_resize(signum, frame):
 signal.signal(signal.SIGWINCH, on_resize)  # Terminal resize
 
 # ─── MAIN LOOP ──────────────────────────────────────────────
+def start_speedtest_thread():
+    """Jalankan speedtest di background thread, non-blocking."""
+    global speedtest_pending, speedtest_result, speedtest_error
+    
+    with speedtest_lock:
+        if speedtest_pending:
+            return  # sudah ada speedtest berjalan
+        speedtest_pending = True
+        speedtest_error = None
+    
+    def _run():
+        global speedtest_pending, speedtest_result, speedtest_error
+        try:
+            result = run_speedtest()
+            with speedtest_lock:
+                if result:
+                    speedtest_result = result
+                    speedtest_error = None
+                else:
+                    speedtest_error = "gagal / timeout"
+                speedtest_pending = False
+        except Exception as e:
+            with speedtest_lock:
+                speedtest_error = str(e)[:30]
+                speedtest_pending = False
+    
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
 def main():
     global sukses, gagal, status_terakhir, waktu_perubahan
-    global speedtest_result, running
+    global speedtest_result, speedtest_pending, speedtest_error, running
 
     # Clear screen & hide cursor
     os.system("clear" if os.name == "posix" else "cls")
@@ -402,18 +440,9 @@ def main():
                     if ch.lower() == "q":
                         running = False
                     elif ch.lower() == "s":
-                        # Speedtest mode
-                        sys.stdout.write(C_SHOW_CURSOR)
-                        sys.stdout.flush()
-                        draw_dashboard()
-                        # Overlay speedtest status
-                        sys.stdout.write(
-                            f"\033[15;2H{C_BOLD}{C_YELLOW}  ⏳ Menjalankan speedtest...{C_RESET}"
-                        )
-                        sys.stdout.flush()
-                        speedtest_result = run_speedtest()
-                        sys.stdout.write(C_HIDE_CURSOR)
-                        sys.stdout.flush()
+                        # Speedtest non-blocking via background thread
+                        if not speedtest_pending:
+                            start_speedtest_thread()
                     elif ch.lower() == "r":
                         # Reset stats
                         sukses = 0
@@ -423,7 +452,10 @@ def main():
                         log_transisi.clear()
                         status_terakhir = None
                         waktu_perubahan = datetime.now()
-                        speedtest_result = None
+                        with speedtest_lock:
+                            speedtest_result = None
+                            speedtest_error = None
+                            speedtest_pending = False
                     elif ch.lower() == "p":
                         # Pause - tunggu key lagi
                         sys.stdout.write(
