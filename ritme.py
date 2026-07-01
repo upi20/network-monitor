@@ -18,7 +18,7 @@ from collections import deque
 # ─── KONFIGURASI ───────────────────────────────────────────
 TARGET = "8.8.8.8"
 PING_INTERVAL = 1  # detik
-SPARKLINE_WIDTH = 50  # jumlah bar di sparkline
+SPARKLINE_WIDTH = 46  # jumlah bar di sparkline (<= BOX_W - 4)
 LOG_MAX = 5  # jumlah log transisi yang ditampilkan
 
 # ─── ANSI COLORS ────────────────────────────────────────────
@@ -62,7 +62,7 @@ running = True
 
 def strip_ansi(text):
     """Hapus ANSI escape codes untuk hitung panjang visual."""
-    return re.sub(r"\033\[[0-9;]*[a-zA-Z]", "", text)
+    return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
 
 
 def ping_once(target):
@@ -254,29 +254,33 @@ def draw_dashboard():
     out.append(f"{BOX_ML}{BOX_H * inner}{BOX_MR}")
 
     # ─── SPARKLINE ───
+    # Trim ke max SPARK_W biar nggak overflow box
+    data = list(sparkline_data)
+    if len(data) > SPARK_W:
+        data = data[-SPARK_W:]
     spark = ""
-    for online in sparkline_data:
+    for online in data:
         spark += f"{C_BG_GREEN} {C_RESET}" if online else f"{C_BG_RED} {C_RESET}"
-    spark += f"{C_DIM}·{C_RESET}" * max(0, SPARK_W - len(sparkline_data))
+    spark += f"{C_DIM}·{C_RESET}" * max(0, SPARK_W - len(data))
     out.append(box_row(f" {spark}"))
 
-    # Status durasi
+    # Durasi status — pendekin biar muat
     dur = format_durasi((now - waktu_perubahan).total_seconds())
     if status_terakhir:
-        out.append(box_row(f" {C_GREEN}▸ ONLINE{C_RESET} — {C_BOLD}{dur}{C_RESET}"))
+        out.append(box_row(f" {C_GREEN}ONLINE{C_RESET} {C_BOLD}{dur}{C_RESET}"))
     elif status_terakhir is False:
-        out.append(box_row(f" {C_RED}▸ TERPUTUS{C_RESET} — {C_BOLD}{dur}{C_RESET}"))
+        out.append(box_row(f" {C_RED}TERPUTUS{C_RESET} {C_BOLD}{dur}{C_RESET}"))
     else:
-        out.append(box_row(f" {C_YELLOW}▸ Menunggu data...{C_RESET}"))
+        out.append(box_row(f" {C_YELLOW}Menunggu data...{C_RESET}"))
 
     # ─── SEPARATOR ───
     out.append(f"{BOX_ML}{BOX_H * inner}{BOX_MR}")
 
     # ─── STATISTIK ───
-    out.append(box_row(f" {C_BOLD}PING{C_RESET}  OK:{C_GREEN}{sukses}{C_RESET} RTO:{C_RED}{gagal}{C_RESET} Loss:{loss_pct:.1f}%"))
+    out.append(box_row(f" {C_BOLD}PING{C_RESET}  {C_GREEN}OK:{sukses}{C_RESET} {C_RED}RTO:{gagal}{C_RESET} Loss:{loss_pct:.1f}%"))
     out.append(box_row(
-        f"   Avg:{format_latency(avg_lat)} Min:{format_latency(min_lat)} "
-        f"Max:{format_latency(max_lat)} Jitter:{jitter:.0f}ms"
+        f"   Avg:{format_latency(avg_lat)} Min:{format_latency(min_lat)}"
+        f" Max:{format_latency(max_lat)} Jit:{jitter:.0f}ms"
     ))
 
     # ─── HISTOGRAM LATENCY ───
@@ -292,15 +296,17 @@ def draw_dashboard():
     # ─── SPEEDTEST ───
     out.append(box_row(f" {C_BOLD}SPEEDTEST{C_RESET} ({C_YELLOW}S{C_RESET}=test)"))
     if speedtest_pending:
-        out.append(box_row(f"   {C_YELLOW}⏳ Menjalankan speedtest...{C_RESET}"))
+        out.append(box_row(f"   {C_YELLOW}⏳ Menjalankan...{C_RESET}"))
     elif speedtest_error:
         out.append(box_row(f"   {C_RED}✗ {speedtest_error}{C_RESET}"))
     elif speedtest_result:
         st = speedtest_result
+        # Shorten: "79.29 Mbit/s" → "79Mbps"
+        dl = st.get('download', '?').replace(' Mbit/s', 'M').replace(' Kbit/s', 'K').replace(' Gbit/s', 'G')
+        ul = st.get('upload', '?').replace(' Mbit/s', 'M').replace(' Kbit/s', 'K').replace(' Gbit/s', 'G')
+        p = st.get('ping', '?')
         out.append(box_row(
-            f"   {C_GREEN}↓{C_RESET}{st.get('download','?')} "
-            f"{C_CYAN}↑{C_RESET}{st.get('upload','?')} "
-            f"Ping:{st.get('ping','?')}ms"
+            f"   {C_GREEN}↓{C_RESET}{dl} {C_CYAN}↑{C_RESET}{ul} P:{p}ms"
         ))
     else:
         out.append(box_row(f"   {C_DIM}Tekan S untuk mulai{C_RESET}"))
