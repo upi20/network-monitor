@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-RITME - Network Rhythm Monitor
-Dashboard CLI untuk monitoring jaringan via ping + speedtest.
-Dioptimalkan untuk layar kecil (mobile/portrait terminal).
+RITME — Network Rhythm Monitor
+Dashboard CLI untuk monitoring koneksi via ping + speedtest.
+Adaptif: mobile (min 42 cols) sampai laptop (full terminal width).
+Stateless & memory-safe untuk dijalankan 24 jam nonstop.
 """
 
 import subprocess
@@ -12,14 +13,17 @@ import sys
 import os
 import signal
 import threading
+import gc
 from datetime import datetime
 from collections import deque
 
 # ─── KONFIGURASI ───────────────────────────────────────────
 TARGET = "8.8.8.8"
-PING_INTERVAL = 1  # detik
-SPARKLINE_WIDTH = 46  # jumlah bar di sparkline (<= BOX_W - 4)
-LOG_MAX = 5  # jumlah log transisi yang ditampilkan
+PING_INTERVAL = 1                 # detik antar ping
+LOG_MAX = 200                     # simpan 200 transisi terakhir (~aman 24 jam)
+LATENCY_BUFFER = 500              # simpan 500 latency terakhir (cukup untuk histogram akurat)
+SPARKLINE_DEFAULT = 80            # sparkline fallback kalau terminal kecil
+GC_INTERVAL = 3600                # gc colektor setiap ~1 jam ping
 
 # ─── ANSI COLORS ────────────────────────────────────────────
 C_RESET = "\033[0m"
@@ -38,57 +42,47 @@ C_SHOW_CURSOR = "\033[?25h"
 C_CLEAR_SCREEN = "\033[2J"
 C_HOME = "\033[H"
 
-# ─── BOX DRAWING (unicode) ─────────────────────────────────
-# Fallback ke ASCII kalau terminal nggak support
+# ─── BOX DRAWING ───────────────────────────────────────────
 BOX_TL = "┌"; BOX_TR = "┐"; BOX_BL = "└"; BOX_BR = "┘"
 BOX_H = "─"; BOX_V = "│"; BOX_ML = "├"; BOX_MR = "┤"
 
-# ─── STATE ──────────────────────────────────────────────────
+# ─── STATE (semua bounded deque → no memory leak) ───────────
 sukses = 0
 gagal = 0
-latencies = deque(maxlen=100)  # simpan 100 latency terakhir
-sparkline_data = deque(maxlen=SPARKLINE_WIDTH)  # True=online, False=offline
+latencies = deque(maxlen=LATENCY_BUFFER)
+sparkline_data = deque(maxlen=SPARKLINE_DEFAULT)
 log_transisi = deque(maxlen=LOG_MAX)
 status_terakhir = None
 waktu_perubahan = datetime.now()
 session_start = datetime.now()
 speedtest_result = None
-speedtest_pending = False  # True saat speedtest sedang jalan di background
-speedtest_error = None     # pesan error speedtest
+speedtest_pending = False
+speedtest_error = None
 speedtest_lock = threading.Lock()
 running = True
+ping_counter = 0
 
 # ─── FUNCTIONS ──────────────────────────────────────────────
 
 def strip_ansi(text):
-    """Hapus ANSI escape codes untuk hitung panjang visual."""
     return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", text)
 
 
 def ping_once(target):
-    """Ping satu kali, return (online: bool, latency_ms: float or None)."""
     try:
         hasil = subprocess.run(
             ["ping", "-c", "1", "-W", "1", target],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
         if hasil.returncode == 0:
             out = hasil.stdout
-            # Format 1: "time=X.XX ms" (Linux/standar)
-            match = re.search(r"time=(\d+\.?\d*)\s*ms", out)
-            if match:
-                return True, float(match.group(1))
-            # Format 2: macOS summary "min/avg/max/stddev = X/Y/Z/W ms"
-            match = re.search(r"min/avg/max/stddev\s*=\s*[\d.]+/([\d.]+)/", out)
-            if match:
-                return True, float(match.group(1))
-            # Format 3: macOS dengan -W "packets out of wait time" tapi masih received
+            m = re.search(r"time=(\d+\.?\d*)\s*ms", out)
+            if m: return True, float(m.group(1))
+            m = re.search(r"min/avg/max/stddev\s*=\s*[\d.]+/([\d.]+)/", out)
+            if m: return True, float(m.group(1))
             if "1 packets received" in out and "0.0% packet loss" in out:
-                match = re.search(r"=\s*([\d.]+)/([\d.]+)/", out)
-                if match:
-                    return True, float(match.group(2))
+                m = re.search(r"=\s*([\d.]+)/([\d.]+)/", out)
+                if m: return True, float(m.group(2))
             return True, None
         return False, None
     except Exception:
@@ -96,14 +90,10 @@ def ping_once(target):
 
 
 def run_speedtest():
-    """Jalankan speedtest-cli, return dict hasil atau None."""
     try:
         hasil = subprocess.run(
             ["speedtest-cli", "--simple"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=60,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=60,
         )
         if hasil.returncode == 0:
             data = {}
@@ -121,47 +111,37 @@ def run_speedtest():
 
 
 def format_durasi(detik):
-    """Format detik ke string ringkas."""
-    if detik < 60:
-        return f"{detik:.0f}dtk"
+    if detik < 0: return "0dtk"
+    if detik < 60: return f"{detik:.0f}dtk"
     elif detik < 3600:
-        m, s = divmod(detik, 60)
-        return f"{int(m)}m{int(s)}dtk"
+        m, s = divmod(int(detik), 60); return f"{m}m{s}dtk"
+    elif detik < 86400:
+        h, r = divmod(int(detik), 3600); m, s = divmod(r, 60); return f"{h}j{m}m"
     else:
-        h, r = divmod(detik, 3600)
-        m, s = divmod(r, 60)
-        return f"{int(h)}j{int(m)}m"
+        d, r = divmod(int(detik), 86400); h, m = divmod(r, 3600); return f"{d}h{h}j"
 
 
-def get_terminal_width():
-    """Dapatkan lebar terminal, fallback ke 60."""
+def get_terminal_size():
     try:
-        return os.get_terminal_size().columns
+        sz = os.get_terminal_size(); return sz.columns, sz.lines
     except Exception:
-        return 60
+        return 80, 24
 
 
-def latency_histogram(lat_list, bar_max=8):
-    """Buat histogram mini ASCII dari distribusi latency."""
-    if not lat_list:
-        return f"{C_DIM}tidak ada data{C_RESET}"
-    
+def latency_histogram(lat_list, bar_max=10):
+    if not lat_list: return f"{C_DIM}--{C_RESET}"
     buckets = [
         ("<10", 0, 10), ("10-25", 10, 25), ("25-50", 25, 50),
         ("50-100", 50, 100), ("100-200", 100, 200),
         ("200-500", 200, 500), ("500+", 500, float("inf")),
     ]
-    
     counts = [0] * len(buckets)
     for lat in lat_list:
         for i, (_, lo, hi) in enumerate(buckets):
-            if lo <= lat < hi:
-                counts[i] += 1
-                break
-    
+            if lo <= lat < hi: counts[i] += 1; break
     m = max(counts) if max(counts) > 0 else 1
     result = ""
-    for i, (label, _, _) in enumerate(buckets):
+    for i, (_, _, _) in enumerate(buckets):
         n = int(counts[i] / m * bar_max) if counts[i] > 0 else 0
         if counts[i] > 0:
             color = C_GREEN if i < 2 else (C_YELLOW if i < 4 else C_RED)
@@ -169,264 +149,207 @@ def latency_histogram(lat_list, bar_max=8):
         else:
             result += f"{C_DIM}▄{C_RESET}"
         result += " "
-    return result.strip()
+    return result.rstrip()
 
 
 def format_latency(lat_ms):
-    """Format latency dengan warna."""
-    if lat_ms is None:
-        return f"{C_DIM}---{C_RESET}"
-    if lat_ms < 30:
-        color = C_GREEN
-    elif lat_ms < 80:
-        color = C_YELLOW
-    else:
-        color = C_RED
+    if lat_ms is None: return f"{C_DIM}---{C_RESET}"
+    if lat_ms < 30: color = C_GREEN
+    elif lat_ms < 80: color = C_YELLOW
+    else: color = C_RED
     return f"{color}{lat_ms:.0f}ms{C_RESET}"
 
 
 def pad_visible(text, target_width):
-    """Pad string ke target_width berdasarkan lebar visual (tanpa ANSI)."""
-    visible_len = len(strip_ansi(text))
-    padding = target_width - visible_len
-    return text + (" " * max(0, padding))
+    return text + (" " * max(0, target_width - len(strip_ansi(text))))
 
+
+# ─── DASHBOARD ──────────────────────────────────────────────
 
 def draw_dashboard():
-    """Render seluruh dashboard dalam satu frame, adaptif lebar terminal."""
     now = datetime.now()
     elapsed = (now - session_start).total_seconds()
     total = sukses + gagal
     loss_pct = (gagal / total * 100) if total > 0 else 0
     uptime_pct = 100 - loss_pct
 
-    # Adaptive width: min 42, max deteksi terminal
-    tw = get_terminal_width()
-    BOX_W = max(42, min(tw, 50))  # batasi 42-50 kolom
-    SPARK_W = BOX_W - 4  # sparkline mengikuti lebar box
+    tw, th = get_terminal_size()
+    BOX_W = max(42, min(tw, 120))
+    inner = BOX_W - 2
+    SPARK_W = min(inner - 1, 200)
+    HIST_BARS = max(6, min(14, (inner - 16) // 2))
+    FIXED = 15
+    LOG_AREA = max(2, th - FIXED)
 
-    # Rata-rata, min, max latency
     lat_list = [l for l in latencies if l is not None]
     avg_lat = sum(lat_list) / len(lat_list) if lat_list else 0
     min_lat = min(lat_list) if lat_list else 0
     max_lat = max(lat_list) if lat_list else 0
     jitter = (
         sum(abs(lat_list[i] - lat_list[i - 1]) for i in range(1, len(lat_list)))
-        / (len(lat_list) - 1)
-        if len(lat_list) > 1
-        else 0
+        / (len(lat_list) - 1) if len(lat_list) > 1 else 0
     )
 
-    # Status warna
     if status_terakhir is None:
-        status_color, status_icon, status_text = C_YELLOW, "⏳", "MENUNGGU"
+        sc, si, st = C_YELLOW, "⏳", "MENUNGGU"
     elif status_terakhir:
-        status_color, status_icon, status_text = C_GREEN, "●", "ONLINE"
+        sc, si, st = C_GREEN, "●", "ONLINE"
     else:
-        status_color, status_icon, status_text = C_RED, "●", "TERPUTUS"
+        sc, si, st = C_RED, "●", "TERPUTUS"
 
-    def box_row(left_text):
-        inner_w = BOX_W - 2
-        return f"{BOX_V}{pad_visible(left_text, inner_w)}{BOX_V}"
+    def box_row(t):
+        return f"{BOX_V}{pad_visible(t, inner)}{BOX_V}"
 
-    # Clear screen immediately, then build frame
     sys.stdout.write(C_CLEAR_SCREEN + C_HOME + C_HIDE_CURSOR)
     sys.stdout.flush()
 
-    inner = BOX_W - 2
     out = []
 
-    # ─── HEADER ───
+    # HEADER
     out.append(f"{C_BOLD}{C_CYAN}{BOX_TL}{BOX_H * inner}{BOX_TR}{C_RESET}")
-    
-    # Baris status
-    status_line = f" {status_color}{status_icon} {status_text}{C_RESET}"
-    title = f"{C_BOLD}RITME{C_RESET}"
-    time_str = f"{C_DIM}{now.strftime('%H:%M:%S')}{C_RESET}"
-    out.append(box_row(f"{status_line}  {title}  {time_str}"))
-    
-    # Baris uptime + target
-    out.append(box_row(
-        f" {TARGET}  Uptime:{C_GREEN}{uptime_pct:.1f}%{C_RESET}"
-    ))
+    out.append(box_row(f" {sc}{si} {st}{C_RESET}   {C_BOLD}RITME{C_RESET}   {C_DIM}{now.strftime('%H:%M:%S')}{C_RESET}"))
+    out.append(box_row(f" {TARGET}   Uptime:{C_GREEN}{uptime_pct:.1f}%{C_RESET}   Sesi:{C_DIM}{format_durasi(elapsed)}{C_RESET}"))
 
-    # ─── SEPARATOR ───
     out.append(f"{BOX_ML}{BOX_H * inner}{BOX_MR}")
 
-    # ─── SPARKLINE ───
-    # Trim ke max SPARK_W biar nggak overflow box
-    data = list(sparkline_data)
-    if len(data) > SPARK_W:
-        data = data[-SPARK_W:]
+    # SPARKLINE
+    sdata = list(sparkline_data)
+    if len(sdata) > SPARK_W: sdata = sdata[-SPARK_W:]
     spark = ""
-    for online in data:
+    for online in sdata:
         spark += f"{C_BG_GREEN} {C_RESET}" if online else f"{C_BG_RED} {C_RESET}"
-    spark += f"{C_DIM}·{C_RESET}" * max(0, SPARK_W - len(data))
+    spark += f"{C_DIM}·{C_RESET}" * max(0, SPARK_W - len(sdata))
     out.append(box_row(f" {spark}"))
 
-    # Durasi status — pendekin biar muat
     dur = format_durasi((now - waktu_perubahan).total_seconds())
     if status_terakhir:
-        out.append(box_row(f" {C_GREEN}ONLINE{C_RESET} {C_BOLD}{dur}{C_RESET}"))
+        out.append(box_row(f" {C_GREEN}ONLINE{C_RESET} — {C_BOLD}{dur}{C_RESET}"))
     elif status_terakhir is False:
-        out.append(box_row(f" {C_RED}TERPUTUS{C_RESET} {C_BOLD}{dur}{C_RESET}"))
+        out.append(box_row(f" {C_RED}TERPUTUS{C_RESET} — {C_BOLD}{dur}{C_RESET}"))
     else:
         out.append(box_row(f" {C_YELLOW}Menunggu data...{C_RESET}"))
 
-    # ─── SEPARATOR ───
     out.append(f"{BOX_ML}{BOX_H * inner}{BOX_MR}")
 
-    # ─── STATISTIK ───
-    out.append(box_row(f" {C_BOLD}PING{C_RESET}  {C_GREEN}OK:{sukses}{C_RESET} {C_RED}RTO:{gagal}{C_RESET} Loss:{loss_pct:.1f}%"))
-    out.append(box_row(
-        f"   Avg:{format_latency(avg_lat)} Min:{format_latency(min_lat)}"
-        f" Max:{format_latency(max_lat)} Jit:{jitter:.0f}ms"
-    ))
-
-    # ─── HISTOGRAM LATENCY ───
+    # PING STATS
+    out.append(box_row(f" {C_BOLD}PING{C_RESET}   {C_GREEN}OK:{sukses}{C_RESET}  {C_RED}RTO:{gagal}{C_RESET}  Loss:{loss_pct:.1f}%  Pkts:{total}"))
+    out.append(box_row(f"   Avg:{format_latency(avg_lat)}  Min:{format_latency(min_lat)}  Max:{format_latency(max_lat)}  Jit:{jitter:.0f}ms"))
     if lat_list:
-        hist = latency_histogram(lat_list, bar_max=min(8, (BOX_W - 20) // 2))
-        out.append(box_row(f"   Dist: {hist}"))
+        out.append(box_row(f"   Dist: {latency_histogram(lat_list, bar_max=HIST_BARS)}"))
+    out.append(box_row(f" {C_DIM}buf: {len(latencies)}/{LATENCY_BUFFER} lat · {len(log_transisi)}/{LOG_MAX} log · v4 laptop{C_RESET}"))
 
-    out.append(box_row(f"   Sesi: {format_durasi(elapsed)}"))
-
-    # ─── SEPARATOR ───
     out.append(f"{BOX_ML}{BOX_H * inner}{BOX_MR}")
 
-    # ─── SPEEDTEST ───
-    out.append(box_row(f" {C_BOLD}SPEEDTEST{C_RESET} ({C_YELLOW}S{C_RESET}=test)"))
+    # SPEEDTEST
+    out.append(box_row(f" {C_BOLD}SPEEDTEST{C_RESET}  {C_YELLOW}[S]{C_RESET}=test  {C_YELLOW}[R]{C_RESET}=reset  {C_YELLOW}[Q]{C_RESET}=quit"))
     if speedtest_pending:
         out.append(box_row(f"   {C_YELLOW}⏳ Menjalankan...{C_RESET}"))
     elif speedtest_error:
         out.append(box_row(f"   {C_RED}✗ {speedtest_error}{C_RESET}"))
     elif speedtest_result:
         st = speedtest_result
-        # Shorten: "79.29 Mbit/s" → "79Mbps"
-        dl = st.get('download', '?').replace(' Mbit/s', 'M').replace(' Kbit/s', 'K').replace(' Gbit/s', 'G')
-        ul = st.get('upload', '?').replace(' Mbit/s', 'M').replace(' Kbit/s', 'K').replace(' Gbit/s', 'G')
-        p = st.get('ping', '?')
-        out.append(box_row(
-            f"   {C_GREEN}↓{C_RESET}{dl} {C_CYAN}↑{C_RESET}{ul} P:{p}ms"
-        ))
+        dl = st.get('download','?').replace(' Mbit/s','M').replace(' Kbit/s','K')
+        ul = st.get('upload','?').replace(' Mbit/s','M').replace(' Kbit/s','K')
+        out.append(box_row(f"   {C_GREEN}↓{C_RESET}{dl}  {C_CYAN}↑{C_RESET}{ul}  Ping:{st.get('ping','?')}ms"))
     else:
-        out.append(box_row(f"   {C_DIM}Tekan S untuk mulai{C_RESET}"))
+        out.append(box_row(f"   {C_DIM}Tekan S untuk speedtest{C_RESET}"))
 
-    # ─── SEPARATOR ───
     out.append(f"{BOX_ML}{BOX_H * inner}{BOX_MR}")
 
-    # ─── LOG ───
-    out.append(box_row(f" {C_BOLD}LOG TRANSISI{C_RESET}"))
+    # LOG — dinamis sesuai tinggi terminal
+    out.append(box_row(f" {C_BOLD}LOG TRANSISI{C_RESET}  ({len(log_transisi)} event)"))
     if log_transisi:
-        for entry in list(log_transisi)[-4:]:  # max 4 baris
+        for entry in list(log_transisi)[-LOG_AREA:]:
             out.append(box_row(f" {entry}"))
     else:
-        out.append(box_row(f"   {C_DIM}stabil — belum ada transisi{C_RESET}"))
+        out.append(box_row(f"   {C_DIM}stabil{C_RESET}"))
 
-    # ─── FOOTER ───
+    # FOOTER
     out.append(f"{C_CYAN}{BOX_BL}{BOX_H * inner}{BOX_BR}{C_RESET}")
-    out.append(f" {C_DIM}Q=Keluar S=Speedtest R=Reset P=Pause{C_RESET}")
+    out.append(f" {C_DIM}Q=Keluar  S=Speedtest  R=Reset  P=Pause{C_RESET}")
 
-    # Flush
     sys.stdout.write("\n".join(out))
     sys.stdout.flush()
 
 
 def draw_final_summary():
-    """Tampilkan ringkasan akhir setelah user quit."""
     os.system("clear" if os.name == "posix" else "cls")
     print(C_SHOW_CURSOR, end="")
-
     total = sukses + gagal
     loss_pct = (gagal / total * 100) if total > 0 else 0
     elapsed = (datetime.now() - session_start).total_seconds()
-
     lat_list = [l for l in latencies if l is not None]
     avg_lat = sum(lat_list) / len(lat_list) if lat_list else 0
     min_lat = min(lat_list) if lat_list else 0
     max_lat = max(lat_list) if lat_list else 0
-
-    print(f"{C_BOLD}{'═' * 50}{C_RESET}")
+    tw, _ = get_terminal_size()
+    w = max(42, min(tw, 120))
+    line = "═" * (w - 2)
+    print(f"{C_BOLD}{line}{C_RESET}")
     print(f"{C_BOLD}  HASIL AKHIR MONITORING RITME{C_RESET}")
-    print(f"{C_BOLD}{'═' * 50}{C_RESET}")
-    print(f"  Target      : {TARGET}")
-    print(f"  Durasi      : {format_durasi(elapsed)}")
-    print(f"  Mulai       : {session_start.strftime('%H:%M:%S')}")
-    print(f"  Selesai     : {datetime.now().strftime('%H:%M:%S')}")
-    print(f"  {'─' * 46}")
+    print(f"{C_BOLD}{line}{C_RESET}")
+    print(f"  Target : {TARGET}     Durasi : {format_durasi(elapsed)}")
+    print(f"  Mulai  : {session_start.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Akhir  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  {'─' * (w - 4)}")
     print(f"  Total Ping  : {total}")
     print(f"  Sukses      : {C_GREEN}{sukses}{C_RESET}")
     print(f"  Gagal (RTO) : {C_RED}{gagal}{C_RESET}")
-    print(f"  Packet Loss : {loss_pct:.1f}%")
-    print(f"  {'─' * 46}")
-    print(f"  Avg Latency : {avg_lat:.1f} ms")
-    print(f"  Min Latency : {min_lat:.1f} ms")
-    print(f"  Max Latency : {max_lat:.1f} ms")
-    print(f"  {'─' * 46}")
-
-    # Transisi timeline
+    print(f"  Packet Loss : {loss_pct:.2f}%")
+    print(f"  {'─' * (w - 4)}")
+    print(f"  Avg / Min / Max : {avg_lat:.1f} / {min_lat:.1f} / {max_lat:.1f} ms")
+    print(f"  {'─' * (w - 4)}")
     if log_transisi:
-        print(f"  {C_BOLD}Timeline Putus-Nyambung:{C_RESET}")
+        print(f"  {C_BOLD}Timeline ({len(log_transisi)} events):{C_RESET}")
         for entry in log_transisi:
             print(f"    {entry}")
-    print(f"{C_BOLD}{'═' * 50}{C_RESET}")
+    print(f"{C_BOLD}{line}{C_RESET}")
 
 
 def on_resize(signum, frame):
-    """Handle terminal resize."""
     draw_dashboard()
 
 
-# ─── SIGNAL HANDLERS ────────────────────────────────────────
-signal.signal(signal.SIGWINCH, on_resize)  # Terminal resize
+signal.signal(signal.SIGWINCH, on_resize)
 
-# ─── MAIN LOOP ──────────────────────────────────────────────
+
+# ─── SPEEDTEST THREAD ───────────────────────────────────────
+
 def start_speedtest_thread():
-    """Jalankan speedtest di background thread, non-blocking."""
     global speedtest_pending, speedtest_result, speedtest_error
-    
     with speedtest_lock:
-        if speedtest_pending:
-            return  # sudah ada speedtest berjalan
-        speedtest_pending = True
-        speedtest_error = None
-    
+        if speedtest_pending: return
+        speedtest_pending = True; speedtest_error = None
     def _run():
         global speedtest_pending, speedtest_result, speedtest_error
         try:
-            result = run_speedtest()
+            r = run_speedtest()
             with speedtest_lock:
-                if result:
-                    speedtest_result = result
-                    speedtest_error = None
-                else:
-                    speedtest_error = "gagal / timeout"
+                speedtest_result = r; speedtest_error = None if r else "gagal"
                 speedtest_pending = False
         except Exception as e:
             with speedtest_lock:
-                speedtest_error = str(e)[:30]
-                speedtest_pending = False
-    
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+                speedtest_error = str(e)[:30]; speedtest_pending = False
+    threading.Thread(target=_run, daemon=True).start()
 
+
+# ─── MAIN ───────────────────────────────────────────────────
 
 def main():
     global sukses, gagal, status_terakhir, waktu_perubahan
     global speedtest_result, speedtest_pending, speedtest_error, running
+    global ping_counter, sparkline_data
 
-    # Clear screen & hide cursor
+    tw, _ = get_terminal_size()
+    sparkline_data = deque(maxlen=max(46, min(tw - 4, 200)))
+
     os.system("clear" if os.name == "posix" else "cls")
-    sys.stdout.write(C_HIDE_CURSOR)
-    sys.stdout.flush()
+    sys.stdout.write(C_HIDE_CURSOR); sys.stdout.flush()
 
-    # Setup terminal untuk raw input (non-blocking key detection)
     try:
-        import tty
-        import termios
-
+        import tty, termios
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        tty.setcbreak(fd)
+        old_settings = termios.tcgetattr(fd); tty.setcbreak(fd)
         has_raw = True
     except (ImportError, termios.error):
         has_raw = False
@@ -437,79 +360,59 @@ def main():
         while running:
             now = time.time()
 
-            # ─── CHECK KEYBOARD INPUT ───
             if has_raw:
                 import select
-
                 while select.select([sys.stdin], [], [], 0)[0]:
                     ch = sys.stdin.read(1)
-                    if ch.lower() == "q":
-                        running = False
+                    if ch.lower() == "q": running = False
                     elif ch.lower() == "s":
-                        # Speedtest non-blocking via background thread
-                        if not speedtest_pending:
-                            start_speedtest_thread()
+                        if not speedtest_pending: start_speedtest_thread()
                     elif ch.lower() == "r":
-                        # Reset stats
-                        sukses = 0
-                        gagal = 0
-                        latencies.clear()
-                        sparkline_data.clear()
-                        log_transisi.clear()
+                        sukses = 0; gagal = 0; ping_counter = 0
+                        latencies.clear(); sparkline_data.clear(); log_transisi.clear()
                         status_terakhir = None
                         waktu_perubahan = datetime.now()
                         with speedtest_lock:
-                            speedtest_result = None
-                            speedtest_error = None
-                            speedtest_pending = False
+                            speedtest_result = None; speedtest_error = None; speedtest_pending = False
                     elif ch.lower() == "p":
-                        # Pause - tunggu key lagi
                         sys.stdout.write(
-                            f"\033[20;0H{C_BOLD}{C_YELLOW}  ⏸  PAUSED - Press any key to resume...{C_RESET}"
+                            f"\033[{get_terminal_size()[1]};0H"
+                            f"{C_BOLD}{C_YELLOW}  ⏸  PAUSED — tekan apa saja...{C_RESET}"
                         )
-                        sys.stdout.flush()
-                        sys.stdin.read(1)
+                        sys.stdout.flush(); sys.stdin.read(1)
 
-            # ─── PING ───
             if now - last_ping_time >= PING_INTERVAL:
                 last_ping_time = now
                 is_online, latency = ping_once(TARGET)
+                ping_counter += 1
 
-                if is_online:
-                    sukses += 1
-                else:
-                    gagal += 1
+                if is_online: sukses += 1
+                else: gagal += 1
 
                 sparkline_data.append(is_online)
-                if latency is not None:
-                    latencies.append(latency)
+                if latency is not None: latencies.append(latency)
 
-                # Track transisi
                 waktu_sekarang = datetime.now()
                 if status_terakhir is not None and status_terakhir != is_online:
                     durasi = (waktu_sekarang - waktu_perubahan).total_seconds()
-                    kondisi = (
-                        f"{C_GREEN}NYAMBUNG{C_RESET}"
-                        if is_online
-                        else f"{C_RED}TERPUTUS{C_RESET}"
-                    )
+                    kondisi = f"{C_GREEN}NYAMBUNG{C_RESET}" if is_online else f"{C_RED}TERPUTUS{C_RESET}"
                     log_transisi.append(
                         f"{waktu_sekarang.strftime('%H:%M:%S')}  {kondisi}  "
                         f"(sebelumnya {format_durasi(durasi)})"
                     )
                     waktu_perubahan = waktu_sekarang
-
                 status_terakhir = is_online
 
-            # ─── REDRAW ───
+                if ping_counter % GC_INTERVAL == 0:
+                    gc.collect()
+
             draw_dashboard()
             time.sleep(0.1)
 
     except KeyboardInterrupt:
         pass
     finally:
-        if has_raw:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        if has_raw: termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     draw_final_summary()
 
