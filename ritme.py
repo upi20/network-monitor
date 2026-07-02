@@ -61,6 +61,9 @@ speedtest_error = None
 speedtest_lock = threading.Lock()
 running = True
 ping_counter = 0
+_redraw_lock = threading.Lock()  # cegah recursive SIGWINCH redraw
+dirty = True                     # redraw on next loop
+last_redraw = 0                  # timestamp redraw terakhir
 
 # ─── FUNCTIONS ──────────────────────────────────────────────
 
@@ -174,12 +177,12 @@ def draw_dashboard():
     uptime_pct = 100 - loss_pct
 
     tw, th = get_terminal_size()
-    BOX_W = max(42, min(tw, 120))
+    BOX_W = max(42, min(tw, 100))   # batasi max 100 biar ringan
     inner = BOX_W - 2
-    SPARK_W = min(inner - 1, 200)
-    HIST_BARS = max(6, min(14, (inner - 16) // 2))
-    FIXED = 15
-    LOG_AREA = max(2, th - FIXED)
+    SPARK_W = min(inner - 1, 100)   # sparkline max 100 kolom
+    HIST_BARS = max(5, min(10, (inner - 16) // 2))
+    FIXED = 16
+    LOG_AREA = max(2, min(th - FIXED, 20))  # max 20 baris log
 
     lat_list = [l for l in latencies if l is not None]
     avg_lat = sum(lat_list) / len(lat_list) if lat_list else 0
@@ -200,7 +203,8 @@ def draw_dashboard():
     def box_row(t):
         return f"{BOX_V}{pad_visible(t, inner)}{BOX_V}"
 
-    sys.stdout.write(C_CLEAR_SCREEN + C_HOME + C_HIDE_CURSOR)
+    # \033[3J clears scrollback buffer juga — cegah scroll-up aneh
+    sys.stdout.write("\033[3J" + C_CLEAR_SCREEN + C_HOME + C_HIDE_CURSOR)
     sys.stdout.flush()
 
     out = []
@@ -212,13 +216,16 @@ def draw_dashboard():
 
     out.append(f"{BOX_ML}{BOX_H * inner}{BOX_MR}")
 
-    # SPARKLINE
-    sdata = list(sparkline_data)
-    if len(sdata) > SPARK_W: sdata = sdata[-SPARK_W:]
+    # SPARKLINE — iterasi deque langsung, tanpa copy ke list
     spark = ""
-    for online in sdata:
-        spark += f"{C_BG_GREEN} {C_RESET}" if online else f"{C_BG_RED} {C_RESET}"
-    spark += f"{C_DIM}·{C_RESET}" * max(0, SPARK_W - len(sdata))
+    n = len(sparkline_data)
+    skip = max(0, n - SPARK_W)
+    i = 0
+    for online in sparkline_data:
+        if i >= skip:
+            spark += f"{C_BG_GREEN} {C_RESET}" if online else f"{C_BG_RED} {C_RESET}"
+        i += 1
+    spark += f"{C_DIM}·{C_RESET}" * max(0, SPARK_W - (n - skip))
     out.append(box_row(f" {spark}"))
 
     dur = format_durasi((now - waktu_perubahan).total_seconds())
@@ -259,7 +266,9 @@ def draw_dashboard():
     # LOG — dinamis sesuai tinggi terminal
     out.append(box_row(f" {C_BOLD}LOG TRANSISI{C_RESET}  ({len(log_transisi)} event)"))
     if log_transisi:
-        for entry in list(log_transisi)[-LOG_AREA:]:
+        # Iterasi dari ujung deque tanpa copy penuh
+        entries = list(log_transisi)
+        for entry in entries[-LOG_AREA:]:
             out.append(box_row(f" {entry}"))
     else:
         out.append(box_row(f"   {C_DIM}stabil{C_RESET}"))
@@ -307,7 +316,8 @@ def draw_final_summary():
 
 
 def on_resize(signum, frame):
-    draw_dashboard()
+    global dirty
+    dirty = True  # trigger redraw dari main loop, jangan langsung
 
 
 signal.signal(signal.SIGWINCH, on_resize)
@@ -339,9 +349,10 @@ def main():
     global sukses, gagal, status_terakhir, waktu_perubahan
     global speedtest_result, speedtest_pending, speedtest_error, running
     global ping_counter, sparkline_data
+    global dirty, last_redraw
 
     tw, _ = get_terminal_size()
-    sparkline_data = deque(maxlen=max(46, min(tw - 4, 200)))
+    sparkline_data = deque(maxlen=max(46, min(tw - 4, 100)))
 
     os.system("clear" if os.name == "posix" else "cls")
     sys.stdout.write(C_HIDE_CURSOR); sys.stdout.flush()
@@ -406,8 +417,18 @@ def main():
                 if ping_counter % GC_INTERVAL == 0:
                     gc.collect()
 
-            draw_dashboard()
-            time.sleep(0.1)
+                # Redraw hanya setelah ping baru — tidak setiap loop
+                draw_dashboard()
+                dirty = False
+                last_redraw = now
+
+            # Speedtest selesai? trigger redraw
+            if not speedtest_pending and dirty:
+                draw_dashboard()
+                dirty = False
+                last_redraw = now
+
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         pass
